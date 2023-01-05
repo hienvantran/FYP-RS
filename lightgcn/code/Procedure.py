@@ -32,7 +32,6 @@ def BPR_train_original(dataset, recommend_model, loss_class, epoch, neg_k=1, w=N
     with timer(name="Sample"):
         S = utils.UniformSample_original(dataset)
 
-
     if ssl_aug_type in ['nd', 'ed']:
         sub_graph1 = Recmodel.create_adj_mat(is_subgraph=True, aug_type=ssl_aug_type)
         sub_graph1 = utils.sp_mat_to_sp_tensor(sub_graph1).to(world.device)

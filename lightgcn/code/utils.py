@@ -174,6 +174,46 @@ def sp_mat_to_sp_tensor(sp_mat):
     indices = torch.from_numpy(np.asarray([coo.row, coo.col]))
     return torch.sparse_coo_tensor(indices, coo.data, coo.shape).coalesce()
 
+def inner_product(a, b):
+    return torch.sum(a*b, dim=-1)
+
+def normalize_adj_matrix(sp_mat, norm_method="left"):
+    """Normalize adjacent matrix
+
+    Args:
+        sp_mat: A sparse adjacent matrix
+        norm_method (str): The normalization method, can be 'symmetric'
+            or 'left'.
+
+    Returns:
+        sp.spmatrix: The normalized adjacent matrix.
+
+    """
+
+    d_in = np.asarray(sp_mat.sum(axis=1))  # indegree
+    if norm_method == "left":
+        rec_d_in = np.power(d_in, -1).flatten()  # reciprocal
+        rec_d_in[np.isinf(rec_d_in)] = 0.  # replace inf
+        rec_d_in = sp.diags(rec_d_in)  # to diagonal matrix
+        norm_sp_mat = rec_d_in.dot(sp_mat)  # left matmul
+    elif norm_method == "symmetric":
+        rec_sqrt_d_in = np.power(d_in, -0.5).flatten()
+        rec_sqrt_d_in[np.isinf(rec_sqrt_d_in)] = 0.
+        rec_sqrt_d_in = sp.diags(rec_sqrt_d_in)
+
+        mid_sp_mat = rec_sqrt_d_in.dot(sp_mat)  # left matmul
+        norm_sp_mat = mid_sp_mat.dot(rec_sqrt_d_in)  # right matmul
+    else:
+        raise ValueError(f"'{norm_method}' is an invalid normalization method.")
+
+    return norm_sp_mat
+
+def ensureDir(dir_path):
+    d = os.path.dirname(dir_path)
+    if not os.path.exists(d):
+        os.makedirs(d)
+
+
 class timer:
     """
     Time context manager for code block

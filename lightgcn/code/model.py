@@ -9,8 +9,10 @@ Define models here
 """
 import world
 import torch
+import torch.sparse as torch_sp
 from dataloader import BasicDataset
 import utils
+import loss
 import time
 from torch import nn
 import torch.nn.functional as F
@@ -40,50 +42,6 @@ class PairWiseModel(BasicModel):
         """
         raise NotImplementedError
     
-class PureMF(BasicModel):
-    def __init__(self, 
-                 config:dict, 
-                 dataset:BasicDataset):
-        super(PureMF, self).__init__()
-        self.num_users  = dataset.n_users
-        self.num_items  = dataset.m_items
-        self.latent_dim = config['latent_dim_rec']
-        self.f = nn.Sigmoid()
-        self.__init_weight()
-        
-    def __init_weight(self):
-        self.embedding_user = torch.nn.Embedding(
-            num_embeddings=self.num_users, embedding_dim=self.latent_dim)
-        self.embedding_item = torch.nn.Embedding(
-            num_embeddings=self.num_items, embedding_dim=self.latent_dim)
-        print("using Normal distribution N(0,1) initialization for PureMF")
-        
-    def getUsersRating(self, users):
-        users = users.long()
-        users_emb = self.embedding_user(users)
-        items_emb = self.embedding_item.weight
-        scores = torch.matmul(users_emb, items_emb.t())
-        return self.f(scores)
-    
-    def bpr_loss(self, users, pos, neg):
-        users_emb = self.embedding_user(users.long())
-        pos_emb   = self.embedding_item(pos.long())
-        neg_emb   = self.embedding_item(neg.long())
-        pos_scores= torch.sum(users_emb*pos_emb, dim=1)
-        neg_scores= torch.sum(users_emb*neg_emb, dim=1)
-        loss = torch.mean(nn.functional.softplus(neg_scores - pos_scores))
-        reg_loss = (1/2)*(users_emb.norm(2).pow(2) + 
-                          pos_emb.norm(2).pow(2) + 
-                          neg_emb.norm(2).pow(2))/float(len(users))
-        return loss, reg_loss
-        
-    def forward(self, users, items):
-        users = users.long()
-        items = items.long()
-        users_emb = self.embedding_user(users)
-        items_emb = self.embedding_item(items)
-        scores = torch.sum(users_emb*items_emb, dim=1)
-        return self.f(scores)
 
 class LightGCN(BasicModel):
     def __init__(self, 
@@ -93,6 +51,18 @@ class LightGCN(BasicModel):
         self.config = config
         self.dataset : dataloader.BasicDataset = dataset
         self.__init_weight()
+    
+    def reset_parameters(self, pretrain=0, init_method="uniform", dir=None):
+        if pretrain:
+            pretrain_user_embedding = np.load(dir + 'user_embeddings.npy')
+            pretrain_item_embedding = np.load(dir + 'item_embeddings.npy')
+            pretrain_user_tensor = torch.FloatTensor(pretrain_user_embedding).cuda()
+            pretrain_item_tensor = torch.FloatTensor(pretrain_item_embedding).cuda()
+            self.user_embeddings = nn.Embedding.from_pretrained(pretrain_user_tensor)
+            self.item_embeddings = nn.Embedding.from_pretrained(pretrain_item_tensor)
+        else:
+            nn.init.normal_(self.embedding_user.weight, std=0.1)
+            nn.init.normal_(self.embedding_item.weight, std=0.1)
 
     def __init_weight(self):
         self.num_users  = self.dataset.n_users
@@ -102,6 +72,7 @@ class LightGCN(BasicModel):
         self.keep_prob = self.config['keep_prob']
         self.A_split = self.config['A_split']
         self.ssl_ratio = self.config["ssl_ratio"]
+        self.dropout = nn.Dropout(0.1)
         self.embedding_user = torch.nn.Embedding(
             num_embeddings=self.num_users, embedding_dim=self.latent_dim)
         self.embedding_item = torch.nn.Embedding(
@@ -119,61 +90,6 @@ class LightGCN(BasicModel):
         print(f"lgn is already to go(dropout:{self.config['dropout']})")
 
         # print("save_txt")
-    def __dropout_x(self, x, keep_prob):
-        size = x.size()
-        index = x.indices().t()
-        values = x.values()
-        random_index = torch.rand(len(values)) + keep_prob
-        random_index = random_index.int().bool()
-        index = index[random_index]
-        values = values[random_index]/keep_prob
-        g = torch.sparse.FloatTensor(index.t(), values, size)
-        return g
-    
-    def __dropout(self, keep_prob):
-        if self.A_split:
-            graph = []
-            for g in self.Graph:
-                graph.append(self.__dropout_x(g, keep_prob))
-        else:
-            graph = self.__dropout_x(self.Graph, keep_prob)
-        return graph
-    
-    def computer(self, graph = None):
-        """
-        propagate methods for lightGCN
-        """       
-        users_emb = self.embedding_user.weight
-        items_emb = self.embedding_item.weight
-        if graph is None:
-            graph = self.Graph
-        all_emb = torch.cat([users_emb, items_emb])
-        #   torch.split(all_emb , [self.num_users, self.num_items])
-        embs = [all_emb]
-        if self.config['dropout']:
-            if self.training:
-                print("droping")
-                g_droped = self.__dropout(self.keep_prob)
-            else:
-                g_droped = graph        
-        else:
-            g_droped = graph    
-        
-        for layer in range(self.n_layers):
-            if self.A_split:
-                temp_emb = []
-                for f in range(len(g_droped)):
-                    temp_emb.append(torch.sparse.mm(g_droped[f], all_emb))
-                side_emb = torch.cat(temp_emb, dim=0)
-                all_emb = side_emb
-            else:
-                all_emb = torch.sparse.mm(g_droped, all_emb)
-            embs.append(all_emb)
-        embs = torch.stack(embs, dim=1)
-        #print(embs.size())
-        light_out = torch.mean(embs, dim=1)
-        users, items = torch.split(light_out, [self.num_users, self.num_items])
-        return users, items
     
     def getUsersRating(self, users):
         all_users, all_items = self.computer()
@@ -191,25 +107,38 @@ class LightGCN(BasicModel):
         pos_emb_ego = self.embedding_item(pos_items)
         neg_emb_ego = self.embedding_item(neg_items)
         return users_emb, pos_emb, neg_emb, users_emb_ego, pos_emb_ego, neg_emb_ego
+  
+    def _forward_gcn(self, norm_adj):
+        ego_embeddings = torch.cat([self.user_embeddings.weight, self.item_embeddings.weight], dim=0)
+        all_embeddings = [ego_embeddings]
 
+        for k in range(self.n_layers):
+            if isinstance(norm_adj, list):
+                ego_embeddings = torch_sp.mm(norm_adj[k], ego_embeddings)
+            else:
+                ego_embeddings = torch_sp.mm(norm_adj, ego_embeddings)
+            all_embeddings += [ego_embeddings]
 
-    def predict(self, users):
-        if self._user_embeddings_final is None or self._item_embeddings_final is None:
-            raise ValueError("Please first switch to 'eval' mode.")
-        user_embs = F.embedding(users, self._user_embeddings_final)
-        temp_item_embs = self._item_embeddings_final
-        ratings = torch.matmul(user_embs, temp_item_embs.T)
-        return ratings
+        all_embeddings = torch.stack(all_embeddings, dim=1).mean(dim=1)
+        user_embeddings, item_embeddings = torch.split(all_embeddings, [self.num_users, self.num_items], dim=0)
 
-    # def eval(self):
-    #     super(LightGCN, self).eval()
-    #     self._user_embeddings_final, self._item_embeddings_final = self.computer(self.Graph)      
+        return user_embeddings, item_embeddings
 
     def forward(self, sub_graph1, sub_graph2, users, items, neg_items):
 
-        user_embeddings, item_embeddings = self.computer(self.Graph)
-        user_embeddings1, item_embeddings1 = self.computer(sub_graph1)
-        user_embeddings2, item_embeddings2 = self.computer(sub_graph2)
+        user_embeddings, item_embeddings = self._forward_gcn(self.Graph)
+        user_embeddings1, item_embeddings1 = self._forward_gcn(sub_graph1)
+        user_embeddings2, item_embeddings2 = self._forward_gcn(sub_graph2)
+
+        user_embeddings, item_embeddings = self._forward_gcn(self.norm_adj)
+        user_embeddings1, item_embeddings1 = self._forward_gcn(sub_graph1)
+        user_embeddings2, item_embeddings2 = self._forward_gcn(sub_graph2)
+
+        # Normalize embeddings learnt from sub-graph to construct SSL loss
+        user_embeddings1 = F.normalize(user_embeddings1, dim=1)
+        item_embeddings1 = F.normalize(item_embeddings1, dim=1)
+        user_embeddings2 = F.normalize(user_embeddings2, dim=1)
+        item_embeddings2 = F.normalize(item_embeddings2, dim=1)
 
         user_embs = F.embedding(users, user_embeddings)
         item_embs = F.embedding(items, item_embeddings)
@@ -219,12 +148,12 @@ class LightGCN(BasicModel):
         user_embs2 = F.embedding(users, user_embeddings2)
         item_embs2 = F.embedding(items, item_embeddings2)
 
-        sup_pos_ratings = self.f(torch.matmul(user_embs, item_embs.t()))       # [batch_size]
-        sup_neg_ratings = self.f(torch.matmul(user_embs, neg_item_embs.t()))   # [batch_size]
+        sup_pos_ratings = utils.inner_product(user_embs, item_embs)       # [batch_size]
+        sup_neg_ratings = utils.inner_product(user_embs, neg_item_embs)   # [batch_size]
         sup_logits = sup_pos_ratings - sup_neg_ratings              # [batch_size]
 
-        pos_ratings_user = self.f(torch.matmul(user_embs1, user_embs2))    # [batch_size]
-        pos_ratings_item = self.f(torch.matmul(item_embs1, item_embs2))     # [batch_size]
+        pos_ratings_user = utils.inner_product(user_embs1, user_embs2)    # [batch_size]
+        pos_ratings_item = utils.inner_product(item_embs1, item_embs2)    # [batch_size]
         tot_ratings_user = torch.matmul(user_embs1, 
                                         torch.transpose(user_embeddings2, 0, 1))        # [batch_size, num_users]
         tot_ratings_item = torch.matmul(item_embs1, 
@@ -234,6 +163,94 @@ class LightGCN(BasicModel):
         ssl_logits_item = tot_ratings_item - pos_ratings_item[:, None]                  # [batch_size, num_users]
 
         return sup_logits, ssl_logits_user, ssl_logits_item
+    
+    def predict(self, users):
+        if self._user_embeddings_final is None or self._item_embeddings_final is None:
+            raise ValueError("Please first switch to 'eval' mode.")
+        user_embs = F.embedding(users, self._user_embeddings_final)
+        temp_item_embs = self._item_embeddings_final
+        ratings = torch.matmul(user_embs, temp_item_embs.T)
+        return ratings
+
+    def eval(self):
+        super(LightGCN, self).eval()
+        self._user_embeddings_final, self._item_embeddings_final = self._forward_gcn(self.norm_adj)
+
+class SGL(BasicModel):
+    def __init__(self, 
+                 config:dict, 
+                 dataset:BasicDataset):
+        super(SGL, self).__init__()
+        self.config = config
+        self.dataset : dataloader.BasicDataset = dataset
+
+        # General hyper-parameters
+        self.reg = config['reg']
+        self.emb_size = config['embed_size']
+        self.batch_size = config['batch_size']
+        self.test_batch_size = config['test_batch_size']
+        self.epochs = config["epochs"]
+        self.verbose = config["verbose"]
+        self.stop_cnt = config["stop_cnt"]
+        self.learner = config["learner"]
+        self.lr = config['lr']
+        self.param_init = config["param_init"]
+
+        # Hyper-parameters for GCN
+        self.n_layers = config['n_layers']
+
+        # Hyper-parameters for SSL
+        self.ssl_aug_type = config["aug_type"].lower()
+        assert self.ssl_aug_type in ['nd','ed', 'rw']
+        self.ssl_reg = config["ssl_reg"]
+        self.ssl_ratio = config["ssl_ratio"]
+        self.ssl_mode = config["ssl_mode"]
+        self.ssl_temp = config["ssl_temp"]
+
+        # Other hyper-parameters
+        self.best_epoch = 0
+        self.best_result = np.zeros([2], dtype=float)
+
+        self.model_str = '#layers=%d-reg=%.0e' % (
+            self.n_layers,
+            self.reg
+        )
+        self.model_str += '/ratio=%.1f-mode=%s-temp=%.2f-reg=%.0e' % (
+            self.ssl_ratio,
+            self.ssl_mode,
+            self.ssl_temp,
+            self.ssl_reg
+        )
+        self.pretrain_flag = config["pretrain_flag"]
+        if self.pretrain_flag:
+            self.epochs = 0
+        self.save_flag = config["save_flag"]
+        self.save_dir, self.tmp_model_dir = None, None
+        if self.pretrain_flag or self.save_flag:
+            self.tmp_model_dir = config.data_dir + '%s/model_tmp/%s/%s/' % (
+                self.dataset_name, 
+                self.model_name,
+                self.model_str)
+            self.save_dir = config.data_dir + '%s/pretrain-embeddings/%s/n_layers=%d/' % (
+                self.dataset_name, 
+                self.model_name,
+                self.n_layers,)
+            utils.ensureDir(self.tmp_model_dir)
+            utils.ensureDir(self.save_dir)
+
+        self.num_users, self.num_items, self.num_ratings = self.dataset.num_users, self.dataset.num_items, self.dataset.num_train_ratings
+
+        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        adj_matrix = self.create_adj_mat()
+        adj_matrix = utils.sp_mat_to_sp_tensor(adj_matrix).to(self.device)
+
+        self.lightgcn = LightGCN(self.num_users, self.num_items, self.emb_size,
+                                  adj_matrix, self.n_layers).to(self.device)
+        if self.pretrain_flag:
+            self.lightgcn.reset_parameters(pretrain=self.pretrain_flag, dir=self.save_dir)
+        else:
+            self.lightgcn.reset_parameters(init_method=self.param_init)
+        self.optimizer = torch.optim.Adam(self.lightgcn.parameters(), lr=self.lr)
 
     def create_adj_mat(self, is_subgraph=False, aug_type='ed'):
         n_nodes = self.num_users + self.num_items
@@ -298,5 +315,110 @@ class LightGCN(BasicModel):
         adj_matrix = norm_adj_tmp.dot(d_mat_inv)
 
         return adj_matrix
+
+    def train_model(self):
+        data_iter = utils.UniformSample_original(self.dataset)                    
+        self.logger.info(self.evaluator.metrics_info())
+        stopping_step = 0
+        for epoch in range(1, self.epochs + 1):
+            total_loss, total_bpr_loss, total_reg_loss = 0.0, 0.0, 0.0
+            training_start_time = time()
+            if self.ssl_aug_type in ['nd', 'ed']:
+                sub_graph1 = self.create_adj_mat(is_subgraph=True, aug_type=self.ssl_aug_type)
+                sub_graph1 = utils.sp_mat_to_sp_tensor(sub_graph1).to(self.device)
+                sub_graph2 = self.create_adj_mat(is_subgraph=True, aug_type=self.ssl_aug_type)
+                sub_graph2 = utils.sp_mat_to_sp_tensor(sub_graph2).to(self.device)
+            else:
+                sub_graph1, sub_graph2 = [], []
+                for _ in range(0, self.n_layers):
+                    tmp_graph = self.create_adj_mat(is_subgraph=True, aug_type=self.ssl_aug_type)
+                    sub_graph1.append(utils.sp_mat_to_sp_tensor(tmp_graph).to(self.device))
+                    tmp_graph = self.create_adj_mat(is_subgraph=True, aug_type=self.ssl_aug_type)
+                    sub_graph2.append(utils.sp_mat_to_sp_tensor(tmp_graph).to(self.device))
+            self.lightgcn.train()
+            for bat_users, bat_pos_items, bat_neg_items in data_iter:
+                bat_users = torch.from_numpy(bat_users).long().to(self.device)
+                bat_pos_items = torch.from_numpy(bat_pos_items).long().to(self.device)
+                bat_neg_items = torch.from_numpy(bat_neg_items).long().to(self.device)
+                sup_logits, ssl_logits_user, ssl_logits_item = self.lightgcn(
+                    sub_graph1, sub_graph2, bat_users, bat_pos_items, bat_neg_items)
+                
+                # BPR Loss
+                bpr_loss = -torch.sum(F.logsigmoid(sup_logits))
+
+                # Reg Loss
+                reg_loss = loss.l2_loss(
+                    self.lightgcn.user_embeddings(bat_users),
+                    self.lightgcn.item_embeddings(bat_pos_items),
+                    self.lightgcn.item_embeddings(bat_neg_items),
+                )
+
+                # InfoNCE Loss
+                clogits_user = torch.logsumexp(ssl_logits_user / self.ssl_temp, dim=1)
+                clogits_item = torch.logsumexp(ssl_logits_item / self.ssl_temp, dim=1)
+                infonce_loss = torch.sum(clogits_user + clogits_item)
+                
+                loss = bpr_loss + self.ssl_reg * infonce_loss + self.reg * reg_loss
+                total_loss += loss
+                total_bpr_loss += bpr_loss
+                total_reg_loss += self.reg * reg_loss
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+            self.logger.info("[iter %d : loss : %.4f = %.4f + %.4f + %.4f, time: %f]" % (
+                epoch, 
+                total_loss/self.num_ratings,
+                total_bpr_loss / self.num_ratings,
+                (total_loss - total_bpr_loss - total_reg_loss) / self.num_ratings,
+                total_reg_loss / self.num_ratings,
+                time()-training_start_time,))
+
+            if epoch % self.verbose == 0 and epoch > self.config['start_testing_epoch']:
+                result, flag = self.evaluate_model()
+                self.logger.info("epoch %d:\t%s" % (epoch, result))
+                if flag:
+                    self.best_epoch = epoch
+                    stopping_step = 0
+                    self.logger.info("Find a better model.")
+                    if self.save_flag:
+                        self.logger.info("Save model to file as pretrain.")
+                        torch.save(self.lightgcn.state_dict(), self.tmp_model_dir)
+                        self.saver.save(self.sess, self.tmp_model_dir)
+                else:
+                    stopping_step += 1
+                    if stopping_step >= self.stop_cnt:
+                        self.logger.info("Early stopping is trigger at epoch: {}".format(epoch))
+                        break
+
+        self.logger.info("best_result@epoch %d:\n" % self.best_epoch)
+        if self.save_flag:
+            self.logger.info('Loading from the saved best model during the training process.')
+            self.lightgcn.load_state_dict(torch.load(self.tmp_model_dir))
+            uebd = self.lightgcn.user_embeddings.weight.cpu().detach().numpy()
+            iebd = self.lightgcn.item_embeddings.weight.cpu().detach().numpy()
+            np.save(self.save_dir + 'user_embeddings.npy', uebd)
+            np.save(self.save_dir + 'item_embeddings.npy', iebd)
+            buf, _ = self.evaluate_model()
+        elif self.pretrain_flag:
+            buf, _ = self.evaluate_model()
+        else:
+            buf = '\t'.join([("%.4f" % x).ljust(12) for x in self.best_result])
+        self.logger.info("\t\t%s" % buf)
+
+    # @timer
+    def evaluate_model(self):
+        flag = False
+        self.lightgcn.eval()
+        current_result, buf = self.evaluator.evaluate(self)
+        if self.best_result[1] < current_result[1]:
+            self.best_result = current_result
+            flag = True
+        return buf, flag
+
+    def predict(self, users):
+        users = torch.from_numpy(np.asarray(users)).long().to(self.device)
+        return self.lightgcn.predict(users).cpu().detach().numpy()
+
 
     
